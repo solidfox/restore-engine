@@ -9,12 +9,14 @@ import Testing
     init() throws { ipsw = try makeIPSW() }
     deinit { try? FileManager.default.removeItem(atPath: (ipsw.path as NSString).deletingLastPathComponent) }
 
-    func makeEngine(_ macs: [SimulatedHost.Mac], restoreSeconds: Double = 4, events: Events = Events()) async -> (Engine, SimulatedHost) {
+    func makeEngine(_ macs: [SimulatedHost.Mac], restoreSeconds: Double = 4, events: Events = Events(),
+                    configure: (inout EngineConfig) -> Void = { _ in }) async -> (Engine, SimulatedHost) {
         let clock = FastClock()
         let host = SimulatedHost(clock: clock, macs: macs)
         await host.setRestoreSeconds(restoreSeconds)
         var config = EngineConfig()
         config.bootWait = 60
+        configure(&config)
         let engine = Engine(config: config, bench: host.bench, door: host.door(), clock: clock, onEvent: events.add)
         await engine.refresh()
         return (engine, host)
@@ -43,6 +45,7 @@ import Testing
         #expect(await host.mac(macA)?.mode == .normal)
         let state = await engine.state()
         #expect(state.restoredPorts == [0])
+        #expect(state.job(macA)?.startedUp == true)
         #expect(events.list.contains(.dfuStarted(port: 0)))
         #expect(events.list.contains { if case .job(let job) = $0 { job.phase == .restoring } else { false } })
 
@@ -217,5 +220,83 @@ import Testing
         #expect(reply.state?.jobs.first?.ecid == macA)
         let decoded = try JSONDecoder().decode(WireMessage.self, from: Data(reply.line().utf8))
         #expect(decoded == reply)
+    }
+
+    // Workshop's conveyor, and the station's hub: DFU on port 0, move the cable, restore
+    // on port 1. Port 0 is free for the next Mac while the first one restores.
+    @Test func conveyor() async throws {
+        let (engine, host) = await makeEngine([mac(macA, port: 0)], restoreSeconds: 200) { $0.ports = [0]; $0.restorePorts = [1] }
+        _ = try await engine.dfu(port: 0, expect: macA)
+        var code = await refusal { try await engine.restore(macA, ipsw: self.ipsw) }
+        #expect(code == .restoreOnDFUPort)
+        await host.move(macA, to: 1)
+        await engine.refresh()
+        #expect(await engine.state().macs.first?.mode == .dfu)
+        try await engine.restore(macA, ipsw: ipsw)
+        await eventually(engine) { $0.phase(macA) == .restoring }
+
+        await host.add(mac(macB, port: 0))
+        let second = try await engine.dfu(port: 0, expect: macB)
+        #expect(second.outcome == .inDFU)
+        await host.move(macB, to: 1)
+        await engine.refresh()
+        try await engine.restore(macB, ipsw: ipsw)
+        await eventually(engine) { $0.phase(macB) == .restoring }
+        #expect(await engine.state().phase(macA) == .restoring)
+        #expect(await host.mostRestoresAtOnce == 2)
+        // DFU on a port that's not a DFU port is refused.
+        code = await refusal { _ = try await engine.dfu(port: 1) }
+        #expect(code == .unknownPort)
+    }
+
+    @Test func movingARestoringMacKillsIt() async throws {
+        let (engine, host) = await makeEngine([mac(macA, port: 1, mode: .dfu)], restoreSeconds: 40)
+        try await engine.restore(macA, ipsw: ipsw)
+        await eventually(engine) { $0.phase(macA) == .restoring }
+        await host.move(macA, to: 2)
+        // The port it's on now is locked too: cfgutil hasn't reported yet.
+        await engine.refresh()
+        if await engine.state().phase(macA) == .restoring {
+            let code = await refusal { _ = try await engine.dfu(port: 2) }
+            #expect(code == .portRestoring)
+        }
+        await eventually(engine) { $0.phase(macA) == .failed }
+        #expect(await engine.state().job(macA)?.failures == 1)
+    }
+
+    @Test func aloneOnRequest() async throws {
+        let (engine, _) = await makeEngine([mac(macA, port: 0, mode: .dfu), mac(macB, port: 1, mode: .dfu)], restoreSeconds: 40)
+        try await engine.restore(macA, ipsw: ipsw, alone: true)
+        try await engine.restore(macB, ipsw: ipsw)
+        let state = await engine.state()
+        #expect(state.job(macA)?.solo == true)
+        #expect(state.phase(macA) == .restoring)
+        #expect(state.phase(macB) == .queued)
+    }
+
+    @Test func doneWithoutStartingUp() async throws {
+        let (engine, host) = await makeEngine([mac(macA, port: 0, mode: .dfu)]) { $0.bootWait = 4 }
+        await host.setStaysOffAfterRestore(true)
+        try await engine.restore(macA, ipsw: ipsw)
+        await eventually(engine) { $0.phase(macA) == .done }
+        let job = await engine.state().job(macA)
+        #expect(job?.startedUp == false)
+        #expect(job?.failures == 0)
+        #expect(job?.error == nil)
+    }
+
+    @Test func portsAndModeSince() async throws {
+        let (engine, host) = await makeEngine([mac(macA, port: 0), mac(macB, port: 2, mode: nil)])
+        var state = await engine.state()
+        #expect(state.activePorts == [0, 2])
+        #expect(state.unreadablePorts == [])
+        let since = state.job(macA)?.modeSince
+        #expect(since != nil)
+        await host.unplug(macB)
+        await engine.refresh()
+        state = await engine.state()
+        #expect(state.activePorts == [0])
+        await engine.refresh()
+        #expect(await engine.state().job(macA)?.modeSince == since)
     }
 }

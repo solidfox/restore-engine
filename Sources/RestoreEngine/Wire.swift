@@ -9,7 +9,7 @@ import Foundation
 ///     ← {"type":"reply","id":"2","ok":false,"refused":{"code":"notInDFU","message":"…"}}
 ///     ← {"type":"job","job":{"ecid":"0x1A2B","phase":"restoring","progress":0.5,…}}
 ///
-/// Ops: `state`, `dfu` (port, expect?), `restore` (ecid, ipsw), `cancel` (ecid), `clear`.
+/// Ops: `state`, `dfu` (port, expect?), `restore` (ecid, ipsw, alone?), `cancel` (ecid), `clear`.
 public struct WireCommand: Codable, Equatable, Sendable {
     public var id: String
     public var op: String
@@ -17,14 +17,16 @@ public struct WireCommand: Codable, Equatable, Sendable {
     public var expect: ECID?
     public var ecid: ECID?
     public var ipsw: String?
+    public var alone: Bool?
 
-    public init(id: String, op: String, port: Int? = nil, expect: ECID? = nil, ecid: ECID? = nil, ipsw: String? = nil) {
+    public init(id: String, op: String, port: Int? = nil, expect: ECID? = nil, ecid: ECID? = nil, ipsw: String? = nil, alone: Bool? = nil) {
         self.id = id
         self.op = op
         self.port = port
         self.expect = expect
         self.ecid = ecid
         self.ipsw = ipsw
+        self.alone = alone
     }
 }
 
@@ -104,7 +106,7 @@ public enum WireServer {
             }
             do {
                 var message = WireMessage.reply(command.id, ok: true)
-                message.job = try await engine.restore(ecid, ipsw: image)
+                message.job = try await engine.restore(ecid, ipsw: image, alone: command.alone ?? false)
                 return message
             } catch {
                 return refused(error)

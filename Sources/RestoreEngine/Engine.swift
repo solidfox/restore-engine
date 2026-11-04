@@ -3,12 +3,15 @@ import Foundation
 public struct EngineConfig: Sendable {
     /// The host's USB-C port controllers that may send DFU.
     public var ports: [Int] = [0, 1, 2]
+    /// Ports a restore may run on; nil = any. A conveyor (DFU on one port, restore on
+    /// others) leaves its DFU port out, so a restore never holds it.
+    public var restorePorts: [Int]? = nil
     /// More than 2 restores at once failed twice: one Mac per cfgutil, at most 2.
     public var maxRestores = 2
     /// After the DFU run, how long a DFU device may take to show up.
     public var dfuAppearWait: Double = 40
     public var poll: Double = 1
-    /// A restored Mac must be back in normal mode within this.
+    /// How long to watch for a restored Mac back in normal mode.
     public var bootWait: Double = 15 * 60
 
     public init() {}
@@ -24,6 +27,7 @@ public enum JobPhase: String, Codable, Sendable {
     case restoring
     /// cfgutil succeeded; waiting for it to boot (normal mode, same ECID).
     case rebooting
+    /// Restored. `startedUp` says whether it was seen in normal mode afterwards.
     case done
     case failed
 }
@@ -34,6 +38,8 @@ public struct Job: Equatable, Sendable, Codable {
     public var phase: JobPhase = .connected
     /// Where it is now; nil mode = not on USB right now.
     public var mode: MacMode?
+    /// Clock time `mode` last changed (e.g. to tell a restore stuck in recovery).
+    public var modeSince: Double?
     public var port: Int?
     /// Last serial seen (normal or recovery mode). DFU hides it.
     public var serial: String?
@@ -44,6 +50,8 @@ public struct Job: Equatable, Sendable, Codable {
     /// Failed restores in a row. A Mac with failures restores alone.
     public var failures = 0
     public var solo = false
+    /// After `done`: seen in normal mode again (true), or not within `bootWait` (false).
+    public var startedUp: Bool?
     public var error: String?
     public var ipsw: IPSWImage?
 
@@ -55,6 +63,7 @@ public struct Job: Equatable, Sendable, Codable {
 public enum RefusalCode: String, Codable, Sendable {
     case unknownPort, scanFailed, dfuRunning, portRestoring, portHasDFUMac, portJustRestored
     case notAlone, notOnPort, wrongMac, notInDFU, alreadyActive, noIPSW, notQueued, unknownMac, shuttingDown, badCommand
+    case restoreOnDFUPort
 }
 
 /// Why the engine won't do something. `code` is the contract; `message` is English for
@@ -90,6 +99,10 @@ public struct EngineState: Equatable, Sendable, Codable {
     public var charger: Bool?
     /// Ports where a Mac was restored and the cable hasn't been unplugged since.
     public var restoredPorts: [Int]
+    /// Ports with something plugged in (hpmN `ConnectionActive`), and ports that couldn't
+    /// be read. A DFU run's own replugs don't show here.
+    public var activePorts: [Int]
+    public var unreadablePorts: [Int]
 }
 
 /// The bench rules, in one place, whoever is pressing the button:
@@ -117,6 +130,10 @@ public actor Engine {
     /// Bumped per restore start, so a superseded cfgutil stream is ignored.
     private var runs: [ECID: Int] = [:]
     private var closed = false
+    private var activePorts: Set<Int> = []
+    private var unreadablePorts: Set<Int> = []
+    /// Bumped when a DFU run starts or ends: a port reading that spans one is skipped.
+    private var dfuRunEvents = 0
 
     public init(config: EngineConfig = EngineConfig(), bench: Bench, door: DFUDoor,
                 clock: EngineClock = SystemClock(), onEvent: @escaping @Sendable (EngineEvent) -> Void = { _ in }) {
@@ -131,7 +148,8 @@ public actor Engine {
 
     public func state() -> EngineState {
         EngineState(macs: macs, jobs: jobs.values.sorted { $0.ecid < $1.ecid }, dfuPort: dfuPort,
-                    charger: charger, restoredPorts: restoredOn.keys.sorted())
+                    charger: charger, restoredPorts: restoredOn.keys.sorted(),
+                    activePorts: activePorts.sorted(), unreadablePorts: unreadablePorts.sorted())
     }
 
     public func job(_ ecid: ECID) -> Job? { jobs[ecid] }
@@ -140,8 +158,17 @@ public actor Engine {
     @discardableResult
     public func refresh() async -> Bool {
         charger = await bench.chargerConnected()
-        for port in config.ports {
-            if await bench.portActive(port) == false { restoredOn[port] = nil }
+        for port in Set(config.ports + (config.restorePorts ?? [])).sorted() {
+            let events = dfuRunEvents
+            let active = await bench.portActive(port)
+            // The DFU run replugs its port in software: not an unplug.
+            if port == dfuPort || events != dfuRunEvents { continue }
+            guard let active else {
+                unreadablePorts.insert(port)
+                continue
+            }
+            unreadablePorts.remove(port)
+            if active { activePorts.insert(port) } else { activePorts.remove(port); restoredOn[port] = nil }
         }
         guard let scanned = await bench.usbMacs() else { return false }
         apply(scanned, at: await clock.now())
@@ -156,6 +183,7 @@ public actor Engine {
         for ecid in jobs.keys {
             update(ecid) { job in
                 let mac = seen[ecid]
+                if job.mode != mac?.mode || job.modeSince == nil { job.modeSince = now }
                 job.mode = mac?.mode
                 job.port = mac?.port
                 if let serial = mac?.serial { job.serial = serial }
@@ -163,10 +191,12 @@ public actor Engine {
             guard let job = jobs[ecid], job.phase == .rebooting else { continue }
             if seen[ecid]?.mode == .normal {
                 bootDeadline[ecid] = nil
-                update(ecid) { $0.phase = .done; $0.step = nil; $0.progress = nil }
+                update(ecid) { $0.phase = .done; $0.startedUp = true; $0.step = nil; $0.progress = nil }
             } else if let deadline = bootDeadline[ecid], now > deadline {
+                // cfgutil said it's restored; it just wasn't seen starting up (a cable out, a Mac
+                // that shuts down). The caller decides what that means.
                 bootDeadline[ecid] = nil
-                update(ecid) { $0.phase = .failed; $0.error = "Restored, but it didn't start up again." }
+                update(ecid) { $0.phase = .done; $0.startedUp = false; $0.step = nil; $0.progress = nil }
             }
         }
         // A queued Mac that left DFU (unplugged, or rebooted) can't restore from there.
@@ -210,10 +240,13 @@ public actor Engine {
 
     /// Sends DFU on `port` and waits for a Mac in DFU there. Reads USB afresh first.
     public func dfu(port: Int, expect: ECID? = nil) async throws(Refusal) -> DFUResult {
-        if let refusal = dfuRefusal(port: port, expect: expect) { throw refusal }
+        // `expect` is checked after the fresh read: the Mac may have been plugged in since the last poll.
+        if let refusal = dfuRefusal(port: port) { throw refusal }
         dfuPort = port
+        dfuRunEvents += 1
         defer {
             dfuPort = nil
+            dfuRunEvents += 1
             pump()
         }
         guard await refresh() else { throw Refusal(.scanFailed, "Couldn't read USB.") }
@@ -258,8 +291,10 @@ public actor Engine {
     // MARK: Restore
 
     /// Queues a restore of a Mac that is in DFU now. It starts when a slot is free.
+    /// `alone`: restore it with nothing else running, as after a failure the engine didn't
+    /// see (a caller that keeps its own history). A Mac that failed here is always alone.
     @discardableResult
-    public func restore(_ ecid: ECID, ipsw: IPSWImage) throws(Refusal) -> Job {
+    public func restore(_ ecid: ECID, ipsw: IPSWImage, alone: Bool = false) throws(Refusal) -> Job {
         if closed { throw Refusal(.shuttingDown, "The engine is stopping.") }
         guard let job = jobs[ecid], let mac = macs.first(where: { $0.ecid == ecid }) else {
             throw Refusal(.unknownMac, "\(ecid) isn't on USB.")
@@ -268,13 +303,17 @@ public actor Engine {
         // Restores begun from recovery or restore mode failed; only DFU works.
         guard mac.mode == .dfu else { throw Refusal(.notInDFU, "\(ecid) isn't in DFU (it's in \(mac.mode.rawValue) mode).") }
         guard dfuPort != mac.port else { throw Refusal(.dfuRunning, "A DFU run is going on port \(mac.port).") }
+        if let allowed = config.restorePorts, !allowed.contains(mac.port) {
+            throw Refusal(.restoreOnDFUPort, "\(ecid) is on port \(mac.port); restores run only on \(allowed.map(String.init).joined(separator: ", ")).")
+        }
         var isDirectory: ObjCBool = false
         guard ipsw.path.hasPrefix("/"), FileManager.default.fileExists(atPath: ipsw.path, isDirectory: &isDirectory),
               !isDirectory.boolValue
         else { throw Refusal(.noIPSW, "No restore image at \(ipsw.path).") }
         update(ecid) { job in
             job.phase = .queued
-            job.solo = job.failures > 0
+            job.solo = alone || job.failures > 0
+            job.startedUp = nil
             job.ipsw = ipsw
             job.error = nil
             job.step = nil
@@ -372,6 +411,10 @@ public actor Engine {
             }
             pump()
         case .failed(let message):
+            // Read USB again first: the job stays restoring (its cable locked) until then,
+            // so the caller sees where the Mac really is (DFU, recovery, gone).
+            await refresh()
+            guard runs[ecid] == run, jobs[ecid]?.phase == .restoring else { return }
             update(ecid) { job in
                 job.phase = .failed
                 job.failures += 1

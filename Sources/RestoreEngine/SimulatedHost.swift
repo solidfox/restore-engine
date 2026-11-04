@@ -21,6 +21,7 @@ public actor SimulatedHost {
         var powersHost: Bool
         var sends = 0
         var hiddenUntilReplug = false
+        var moved = 0
 
         public init(ecid: ECID, serial: String, port: Int, mode: MacMode? = .normal) {
             self.ecid = ecid
@@ -41,6 +42,8 @@ public actor SimulatedHost {
     /// How long a pretend restore takes, in clock seconds.
     public var restoreSeconds: Double = 4
     public var bootSeconds: Double = 2
+    /// A restored Mac stays off instead of starting up (as when it shuts down).
+    public var staysOffAfterRestore = false
     let clock: EngineClock
 
     public init(clock: EngineClock = SystemClock(), macs: [Mac] = []) {
@@ -53,6 +56,14 @@ public actor SimulatedHost {
     public func setCharger(_ on: Bool) { charger = on }
     public func setScanFails(_ fails: Bool) { scanFails = fails }
     public func setRestoreSeconds(_ seconds: Double) { restoreSeconds = seconds }
+    public func setStaysOffAfterRestore(_ off: Bool) { staysOffAfterRestore = off }
+    /// Moves a Mac's cable to another port. It stays in whatever mode it's in (a Mac in
+    /// DFU stays in DFU); a restore running on it dies.
+    public func move(_ ecid: ECID, to port: Int) {
+        guard let index = macs.firstIndex(where: { $0.ecid == ecid }) else { return }
+        macs[index].port = port
+        macs[index].moved += 1
+    }
     public func edit(_ ecid: ECID, _ change: @Sendable (inout Mac) -> Void) {
         if let index = macs.firstIndex(where: { $0.ecid == ecid }) { change(&macs[index]) }
     }
@@ -111,8 +122,9 @@ public actor SimulatedHost {
         let fails = macs[index].restoreFailures > 0
         if fails { macs[index].restoreFailures -= 1 }
         macs[index].mode = .restore
+        let moves = macs[index].moved
         await clock.sleep(restoreSeconds)
-        guard let after = macs.firstIndex(where: { $0.ecid == ecid }) else {
+        guard let after = macs.firstIndex(where: { $0.ecid == ecid }), macs[after].moved == moves else {
             return .failed("The device was disconnected. (Domain: AMRestoreErrorDomain Code: 9)")
         }
         if fails {
@@ -121,6 +133,7 @@ public actor SimulatedHost {
         }
         macs[after].mode = nil
         macs[after].sends = 0
+        if staysOffAfterRestore { return .succeeded }
         let clock = clock
         let boot = bootSeconds
         Task {

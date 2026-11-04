@@ -1,7 +1,7 @@
 import Foundation
 import RestoreEngine
 
-// `restore-engine serve [--sim] [--dfu-tool PATH] [--ports 0,1,2]`
+// `restore-engine serve [--sim] [--dfu-tool PATH] [--ports 0,1,2] [--restore-ports 1,2]`
 //     JSON lines on stdin/stdout (see `WireServer`). Runs as the user; DFU goes through
 //     `sudo -n <dfu-tool> dfu --port N`. On stdin EOF it takes no new work and exits once
 //     no restore is running: closing the pipe never kills a restore.
@@ -44,6 +44,11 @@ while !arguments.isEmpty {
         let ports = arguments.removeFirst().split(separator: ",").compactMap { Int($0) }
         guard !ports.isEmpty, ports.allSatisfy(RootTool.ports.contains) else { fail("bad --ports") }
         config.ports = ports
+    case "--restore-ports":
+        guard !arguments.isEmpty else { fail("--restore-ports needs a list") }
+        let ports = arguments.removeFirst().split(separator: ",").compactMap { Int($0) }
+        guard !ports.isEmpty, ports.allSatisfy((0...15).contains) else { fail("bad --restore-ports") }
+        config.restorePorts = ports
     default: fail("unknown flag \(flag)")
     }
 }
@@ -72,7 +77,7 @@ case "status":
 case "serve":
     break
 default:
-    fail("usage: restore-engine serve|status [--sim] [--dfu-tool PATH] [--ports 0,1,2]")
+    fail("usage: restore-engine serve|status [--sim] [--dfu-tool PATH] [--ports 0,1,2] [--restore-ports 1,2]")
 }
 
 let engine = Engine(config: config, bench: bench, door: door) { event in output.send(.event(event)) }
