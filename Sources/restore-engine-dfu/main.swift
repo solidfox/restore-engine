@@ -46,9 +46,8 @@ case "dfu" where arguments.count == 3 && arguments[1] == "--port":
     // main thread, which the wait below blocks. It never ran (3MK8, 2026-11-08).
     Task.detached {
         let outcome = await DFUSequence().run(port: port, tool: ProcessVDMTool(path: tool), clock: SystemClock(),
-                                              dfuOnPort: { port in
-            await MacBench().usbMacs()?.contains { $0.port == port && $0.mode == .dfu } ?? false
-        }, log: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) })
+                                              usbMacs: { await MacBench().usbMacs() },
+                                              log: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) })
         box.set(outcome)
         done.signal()
     }

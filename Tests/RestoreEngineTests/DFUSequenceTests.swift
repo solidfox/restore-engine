@@ -4,9 +4,7 @@ import Testing
 
 @Suite struct DFUSequenceTests {
     func run(_ host: SimulatedHost, port: Int = 0, clock: VirtualClock = VirtualClock()) async -> DFUOutcome {
-        await DFUSequence().run(port: port, tool: host.tool, clock: clock) { port in
-            await host.bench.usbMacs()?.contains { $0.port == port && $0.mode == .dfu } ?? false
-        }
+        await DFUSequence().run(port: port, tool: host.tool, clock: clock) { await host.bench.usbMacs() }
     }
 
     @Test func macThatIsOffGoesStraightIn() async {
@@ -77,7 +75,49 @@ import Testing
         #expect(time >= 30)
         #expect(time < 35)
         let calls = await host.calls
-        // At ~10 s and ~20 s; the 2 s pause after each pushes the third past the limit.
-        #expect(calls.filter { $0 == "replug@0" }.count == 2)
+        // Off (nothing on USB) with the host as source: it may live on the host's power,
+        // so no replug.
+        #expect(!calls.contains("replug@0"))
+    }
+
+    @Test func swappedMacReplugsUntilTheTimeLimit() async {
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0)
+        mac.sendsNeeded = 1_000
+        let host = SimulatedHost(macs: [mac])
+        let clock = VirtualClock()
+        #expect(await run(host, clock: clock) == .sentNotSeen)
+        let calls = await host.calls
+        // At ~10 s and ~20 s, and a last one at the limit.
+        #expect(calls.filter { $0 == "replug@0" }.count == 3)
+    }
+
+    @Test func recoveryMacReplugs() async {
+        // Already sinking from the host, but on: once in DFU it only shows after a replug.
+        let host = SimulatedHost(macs: [.init(ecid: macA, serial: "SIMSERIAL01", port: 0, mode: .recovery)])
+        #expect(await run(host) == .inDFU)
+        let calls = await host.calls
+        #expect(!calls.contains("swapsource@0"))
+        #expect(calls.last == "replug@0")
+    }
+
+    @Test func lateDFUShowsAfterTheLastReplug() async {
+        // Goes into DFU after the 20 s replug: only the replug at the limit shows it.
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0)
+        mac.sendsNeeded = 50
+        let host = SimulatedHost(macs: [mac])
+        #expect(await run(host) == .inDFU)
+        let calls = await host.calls
+        #expect(calls.filter { $0 == "replug@0" }.count == 3)
+    }
+
+    @Test func failedScanStillReplugs() async {
+        // A failed scan says nothing about whether the target is on.
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0, mode: nil)
+        mac.sendsNeeded = 1_000
+        let host = SimulatedHost(macs: [mac])
+        await host.setScanFails(true)
+        #expect(await run(host) == .sentNotSeen)
+        let calls = await host.calls
+        #expect(calls.contains("replug@0"))
     }
 }

@@ -55,7 +55,10 @@ public enum DFUOutcome: String, Equatable, Sendable, Codable {
 /// 2. Resend `dfu` about twice a second: one send often only reboots the target. Stop when a
 ///    DFU device shows on that port, or after `seconds`.
 /// 3. A Mac that was USB host when it went into DFU only shows after the roles are
-///    negotiated again: `replug` every 10 s (the port drops for about a second).
+///    negotiated again: `replug` every 10 s (the port drops for about a second). Only for a
+///    target that was on (it needed a swap, or showed on USB, as in recovery): one that
+///    showed nothing may be running on the host's power alone (a flat battery), and a
+///    replug cuts that power every time.
 public struct DFUSequence: Sendable {
     public var seconds: Double = 30
     public var resendEvery: Double = 0.5
@@ -64,15 +67,16 @@ public struct DFUSequence: Sendable {
 
     public init() {}
 
-    /// `dfuOnPort` says whether a Mac in DFU is on that port right now (read-only USB scan).
-    /// The caller refuses to start while one already is, so a hit is the target.
+    /// `usbMacs` is the read-only USB scan (nil when it failed). The caller refuses to start
+    /// while a Mac on that port is in DFU already, so a DFU hit there is the target.
     public func run(port: Int, tool: VDMTool, clock: EngineClock,
-                    dfuOnPort: @Sendable (Int) async -> Bool,
+                    usbMacs: @Sendable () async -> [USBMac]?,
                     log: @Sendable (String) -> Void = { _ in }) async -> DFUOutcome {
         var nop = await tool.run(.nop, port: port)
         log(nop.output)
         if let early = Self.connectionProblem(nop.output) { return early }
-        if nop.output.contains("Connection: Sink") {
+        let swapped = nop.output.contains("Connection: Sink")
+        if swapped {
             let swap = await tool.run(.swapsource, port: port)
             log("Asked for the power role (swapsource: \(swap.status))")
             nop = await tool.run(.nop, port: port)
@@ -83,6 +87,9 @@ public struct DFUSequence: Sendable {
             return Self.connectionProblem(nop.output) ?? .noReply
         }
 
+        // A failed scan proves nothing: replug as for a Mac that's on.
+        let shown = await usbMacs()?.contains { $0.port == port } ?? true
+        let replugs = swapped || shown
         let start = await clock.now()
         var replugged = start
         var first = true
@@ -94,18 +101,25 @@ public struct DFUSequence: Sendable {
                 if sent.output.contains("0x05ac8092") { return .wrongTargetPort }
                 if sent.output.contains("Did not get a reply") { return .noReply }
             }
-            if await dfuOnPort(port) { return .inDFU }
+            if Self.inDFU(await usbMacs(), port: port) { return .inDFU }
             let now = await clock.now()
-            if now - start >= seconds { return .sentNotSeen }
-            if now - replugged >= replugEvery {
+            let last = now - start >= seconds
+            // Last time round, replug once more: a target that went into DFU after the
+            // previous replug would stay hidden, and on a retry it no longer shows on USB.
+            if replugs, last || now - replugged >= replugEvery {
                 let replug = await tool.run(.replug, port: port)
                 log("Replugged (replug: \(replug.status))")
                 replugged = now
                 await clock.sleep(afterReplug)
-                if await dfuOnPort(port) { return .inDFU }
+                if Self.inDFU(await usbMacs(), port: port) { return .inDFU }
             }
+            if last { return .sentNotSeen }
             await clock.sleep(resendEvery)
         }
+    }
+
+    static func inDFU(_ scan: [USBMac]?, port: Int) -> Bool {
+        scan?.contains { $0.port == port && $0.mode == .dfu } ?? false
     }
 
     static func connectionProblem(_ output: String) -> DFUOutcome? {
