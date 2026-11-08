@@ -102,14 +102,17 @@ public struct DFUSequence: Sendable {
             }
             if await macOnPort(port) == .dfu { return .inDFU }
             let now = await clock.now()
-            if now - start >= seconds { return .sentNotSeen }
-            if replugs, now - replugged >= replugEvery {
+            let last = now - start >= seconds
+            // Last time round, replug once more: a target that went into DFU after the
+            // previous replug would stay hidden, and on a retry it no longer shows on USB.
+            if replugs, last || now - replugged >= replugEvery {
                 let replug = await tool.run(.replug, port: port)
                 log("Replugged (replug: \(replug.status))")
                 replugged = now
                 await clock.sleep(afterReplug)
                 if await macOnPort(port) == .dfu { return .inDFU }
             }
+            if last { return .sentNotSeen }
             await clock.sleep(resendEvery)
         }
     }

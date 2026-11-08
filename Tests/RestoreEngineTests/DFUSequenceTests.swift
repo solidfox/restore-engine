@@ -89,8 +89,8 @@ import Testing
         let clock = VirtualClock()
         #expect(await run(host, clock: clock) == .sentNotSeen)
         let calls = await host.calls
-        // At ~10 s and ~20 s; the 2 s pause after each pushes the third past the limit.
-        #expect(calls.filter { $0 == "replug@0" }.count == 2)
+        // At ~10 s and ~20 s, and a last one at the limit.
+        #expect(calls.filter { $0 == "replug@0" }.count == 3)
     }
 
     @Test func recoveryMacReplugs() async {
@@ -100,5 +100,15 @@ import Testing
         let calls = await host.calls
         #expect(!calls.contains("swapsource@0"))
         #expect(calls.last == "replug@0")
+    }
+
+    @Test func lateDFUShowsAfterTheLastReplug() async {
+        // Goes into DFU after the 20 s replug: only the replug at the limit shows it.
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0)
+        mac.sendsNeeded = 50
+        let host = SimulatedHost(macs: [mac])
+        #expect(await run(host) == .inDFU)
+        let calls = await host.calls
+        #expect(calls.filter { $0 == "replug@0" }.count == 3)
     }
 }
