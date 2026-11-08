@@ -5,7 +5,7 @@ import Testing
 @Suite struct DFUSequenceTests {
     func run(_ host: SimulatedHost, port: Int = 0, clock: VirtualClock = VirtualClock()) async -> DFUOutcome {
         await DFUSequence().run(port: port, tool: host.tool, clock: clock) { port in
-            await host.bench.usbMacs()?.contains { $0.port == port && $0.mode == .dfu } ?? false
+            await host.bench.usbMacs()?.first { $0.port == port }?.mode
         }
     }
 
@@ -77,7 +77,8 @@ import Testing
         #expect(time >= 30)
         #expect(time < 35)
         let calls = await host.calls
-        // Host was source from the start: the target may live on its power, so no replug.
+        // Off (nothing on USB) with the host as source: it may live on the host's power,
+        // so no replug.
         #expect(!calls.contains("replug@0"))
     }
 
@@ -90,5 +91,14 @@ import Testing
         let calls = await host.calls
         // At ~10 s and ~20 s; the 2 s pause after each pushes the third past the limit.
         #expect(calls.filter { $0 == "replug@0" }.count == 2)
+    }
+
+    @Test func recoveryMacReplugs() async {
+        // Already sinking from the host, but on: once in DFU it only shows after a replug.
+        let host = SimulatedHost(macs: [.init(ecid: macA, serial: "SIMSERIAL01", port: 0, mode: .recovery)])
+        #expect(await run(host) == .inDFU)
+        let calls = await host.calls
+        #expect(!calls.contains("swapsource@0"))
+        #expect(calls.last == "replug@0")
     }
 }

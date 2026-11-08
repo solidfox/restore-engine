@@ -181,7 +181,7 @@ struct SimDoor: DFUDoor {
     let sequence: DFUSequence
     func enterDFU(port: Int) async -> DFUOutcome {
         await sequence.run(port: port, tool: SimVDM(host: host), clock: host.clock) { port in
-            await host.usb()?.contains { $0.port == port && $0.mode == .dfu } ?? false
+            await host.usb()?.first { $0.port == port }?.mode
         }
     }
 }
