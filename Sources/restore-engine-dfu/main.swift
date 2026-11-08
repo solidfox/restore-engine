@@ -42,7 +42,9 @@ case "dfu" where arguments.count == 3 && arguments[1] == "--port":
 
     let box = OutcomeBox()
     let done = DispatchSemaphore(value: 0)
-    Task {
+    // Detached: top-level code is on the main actor, and a plain Task would wait for the
+    // main thread, which the wait below blocks. It never ran (3MK8, 2026-11-08).
+    Task.detached {
         let outcome = await DFUSequence().run(port: port, tool: ProcessVDMTool(path: tool), clock: SystemClock(),
                                               dfuOnPort: { port in
             await MacBench().usbMacs()?.contains { $0.port == port && $0.mode == .dfu } ?? false
