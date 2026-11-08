@@ -67,11 +67,10 @@ public struct DFUSequence: Sendable {
 
     public init() {}
 
-    /// `macOnPort` is the mode of the Mac on that port right now, nil if none shows
-    /// (read-only USB scan). The caller refuses to start while one is in DFU already, so a
-    /// DFU hit is the target.
+    /// `usbMacs` is the read-only USB scan (nil when it failed). The caller refuses to start
+    /// while a Mac on that port is in DFU already, so a DFU hit there is the target.
     public func run(port: Int, tool: VDMTool, clock: EngineClock,
-                    macOnPort: @Sendable (Int) async -> MacMode?,
+                    usbMacs: @Sendable () async -> [USBMac]?,
                     log: @Sendable (String) -> Void = { _ in }) async -> DFUOutcome {
         var nop = await tool.run(.nop, port: port)
         log(nop.output)
@@ -88,7 +87,9 @@ public struct DFUSequence: Sendable {
             return Self.connectionProblem(nop.output) ?? .noReply
         }
 
-        let replugs = swapped ? true : await macOnPort(port) != nil
+        // A failed scan proves nothing: replug as for a Mac that's on.
+        let shown = await usbMacs()?.contains { $0.port == port } ?? true
+        let replugs = swapped || shown
         let start = await clock.now()
         var replugged = start
         var first = true
@@ -100,7 +101,7 @@ public struct DFUSequence: Sendable {
                 if sent.output.contains("0x05ac8092") { return .wrongTargetPort }
                 if sent.output.contains("Did not get a reply") { return .noReply }
             }
-            if await macOnPort(port) == .dfu { return .inDFU }
+            if Self.inDFU(await usbMacs(), port: port) { return .inDFU }
             let now = await clock.now()
             let last = now - start >= seconds
             // Last time round, replug once more: a target that went into DFU after the
@@ -110,11 +111,15 @@ public struct DFUSequence: Sendable {
                 log("Replugged (replug: \(replug.status))")
                 replugged = now
                 await clock.sleep(afterReplug)
-                if await macOnPort(port) == .dfu { return .inDFU }
+                if Self.inDFU(await usbMacs(), port: port) { return .inDFU }
             }
             if last { return .sentNotSeen }
             await clock.sleep(resendEvery)
         }
+    }
+
+    static func inDFU(_ scan: [USBMac]?, port: Int) -> Bool {
+        scan?.contains { $0.port == port && $0.mode == .dfu } ?? false
     }
 
     static func connectionProblem(_ output: String) -> DFUOutcome? {

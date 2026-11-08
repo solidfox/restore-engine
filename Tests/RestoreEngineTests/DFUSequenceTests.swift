@@ -4,9 +4,7 @@ import Testing
 
 @Suite struct DFUSequenceTests {
     func run(_ host: SimulatedHost, port: Int = 0, clock: VirtualClock = VirtualClock()) async -> DFUOutcome {
-        await DFUSequence().run(port: port, tool: host.tool, clock: clock) { port in
-            await host.bench.usbMacs()?.first { $0.port == port }?.mode
-        }
+        await DFUSequence().run(port: port, tool: host.tool, clock: clock) { await host.bench.usbMacs() }
     }
 
     @Test func macThatIsOffGoesStraightIn() async {
@@ -110,5 +108,16 @@ import Testing
         #expect(await run(host) == .inDFU)
         let calls = await host.calls
         #expect(calls.filter { $0 == "replug@0" }.count == 3)
+    }
+
+    @Test func failedScanStillReplugs() async {
+        // A failed scan says nothing about whether the target is on.
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0, mode: nil)
+        mac.sendsNeeded = 1_000
+        let host = SimulatedHost(macs: [mac])
+        await host.setScanFails(true)
+        #expect(await run(host) == .sentNotSeen)
+        let calls = await host.calls
+        #expect(calls.contains("replug@0"))
     }
 }
