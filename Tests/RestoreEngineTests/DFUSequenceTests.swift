@@ -77,6 +77,17 @@ import Testing
         #expect(time >= 30)
         #expect(time < 35)
         let calls = await host.calls
+        // Host was source from the start: the target may live on its power, so no replug.
+        #expect(!calls.contains("replug@0"))
+    }
+
+    @Test func swappedMacReplugsUntilTheTimeLimit() async {
+        var mac = SimulatedHost.Mac(ecid: macA, serial: "SIMSERIAL01", port: 0)
+        mac.sendsNeeded = 1_000
+        let host = SimulatedHost(macs: [mac])
+        let clock = VirtualClock()
+        #expect(await run(host, clock: clock) == .sentNotSeen)
+        let calls = await host.calls
         // At ~10 s and ~20 s; the 2 s pause after each pushes the third past the limit.
         #expect(calls.filter { $0 == "replug@0" }.count == 2)
     }

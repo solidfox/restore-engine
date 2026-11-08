@@ -55,7 +55,9 @@ public enum DFUOutcome: String, Equatable, Sendable, Codable {
 /// 2. Resend `dfu` about twice a second: one send often only reboots the target. Stop when a
 ///    DFU device shows on that port, or after `seconds`.
 /// 3. A Mac that was USB host when it went into DFU only shows after the roles are
-///    negotiated again: `replug` every 10 s (the port drops for about a second).
+///    negotiated again: `replug` every 10 s (the port drops for about a second). Only after
+///    a swap: if the host was source from the start, the target may be running on the
+///    host's power alone (a flat battery), and a replug would cut it every time.
 public struct DFUSequence: Sendable {
     public var seconds: Double = 30
     public var resendEvery: Double = 0.5
@@ -72,7 +74,8 @@ public struct DFUSequence: Sendable {
         var nop = await tool.run(.nop, port: port)
         log(nop.output)
         if let early = Self.connectionProblem(nop.output) { return early }
-        if nop.output.contains("Connection: Sink") {
+        let swapped = nop.output.contains("Connection: Sink")
+        if swapped {
             let swap = await tool.run(.swapsource, port: port)
             log("Asked for the power role (swapsource: \(swap.status))")
             nop = await tool.run(.nop, port: port)
@@ -97,7 +100,7 @@ public struct DFUSequence: Sendable {
             if await dfuOnPort(port) { return .inDFU }
             let now = await clock.now()
             if now - start >= seconds { return .sentNotSeen }
-            if now - replugged >= replugEvery {
+            if swapped, now - replugged >= replugEvery {
                 let replug = await tool.run(.replug, port: port)
                 log("Replugged (replug: \(replug.status))")
                 replugged = now
